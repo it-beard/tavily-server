@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ReadResourceRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
+import { mkdir, writeFile, readFile } from 'fs/promises';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 const API_KEY = process.env.TAVILY_API_KEY;
 if (!API_KEY) {
     throw new Error('TAVILY_API_KEY environment variable is required');
 }
+// Get the directory where the script is located
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 const isValidSearchArgs = (args) => typeof args === 'object' &&
     args !== null &&
     typeof args.query === 'string' &&
@@ -15,12 +21,14 @@ const isValidSearchArgs = (args) => typeof args === 'object' &&
         args.search_depth === 'advanced');
 class TavilyServer {
     constructor() {
+        this.searches = { searches: {}, lastQuery: null };
         this.server = new Server({
             name: 'tavily-search-server',
             version: '0.1.0',
         }, {
             capabilities: {
                 tools: {},
+                resources: {},
             },
         });
         this.axiosInstance = axios.create({
@@ -30,12 +38,135 @@ class TavilyServer {
                 'api-key': API_KEY,
             },
         });
+        // Set up data storage paths
+        this.dataDir = join(__dirname, '..', 'data');
+        this.storageFile = join(this.dataDir, 'searches.json');
         this.setupToolHandlers();
+        this.setupResourceHandlers();
         // Error handling
         this.server.onerror = (error) => console.error('[MCP Error]', error);
         process.on('SIGINT', async () => {
             await this.server.close();
             process.exit(0);
+        });
+    }
+    async initializeStorage() {
+        try {
+            // Create data directory if it doesn't exist
+            await mkdir(this.dataDir, { recursive: true });
+            // Try to load existing data
+            try {
+                const data = await readFile(this.storageFile, 'utf-8');
+                this.searches = JSON.parse(data);
+            }
+            catch (error) {
+                // File doesn't exist or is invalid, initialize with empty state
+                this.searches = { searches: {}, lastQuery: null };
+                await this.saveSearches();
+            }
+        }
+        catch (error) {
+            console.error('Failed to initialize storage:', error);
+            throw new Error('Failed to initialize storage');
+        }
+    }
+    async saveSearches() {
+        try {
+            await writeFile(this.storageFile, JSON.stringify(this.searches, null, 2), 'utf-8');
+        }
+        catch (error) {
+            console.error('Failed to save searches:', error);
+            throw new Error('Failed to save searches');
+        }
+    }
+    async saveSearch(query, result) {
+        this.searches.searches[query] = result;
+        this.searches.lastQuery = query;
+        await this.saveSearches();
+    }
+    setupResourceHandlers() {
+        // List available static resources
+        this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+            resources: [
+                {
+                    uri: 'tavily://last-search/result',
+                    name: 'Last Search Result',
+                    description: 'Results from the most recent search query',
+                    mimeType: 'application/json',
+                }
+            ],
+        }));
+        // List resource templates for dynamic resources
+        this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+            resourceTemplates: [
+                {
+                    uriTemplate: 'tavily://search/{query}',
+                    name: 'Search Results by Query',
+                    description: 'Search results for a specific query',
+                    mimeType: 'application/json',
+                },
+            ],
+        }));
+        // Handle resource reading
+        this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+            // Handle static resource: last search result
+            if (request.params.uri === 'tavily://last-search/result') {
+                if (!this.searches.lastQuery || !this.searches.searches[this.searches.lastQuery]) {
+                    throw new McpError(ErrorCode.InvalidRequest, 'No search has been performed yet');
+                }
+                return {
+                    contents: [
+                        {
+                            uri: request.params.uri,
+                            mimeType: 'application/json',
+                            text: JSON.stringify(this.searches.searches[this.searches.lastQuery], null, 2),
+                        },
+                    ],
+                };
+            }
+            // Handle dynamic resource: search by query
+            const searchMatch = request.params.uri.match(/^tavily:\/\/search\/(.+)$/);
+            if (searchMatch) {
+                const query = decodeURIComponent(searchMatch[1]);
+                // First check if we already have this search stored
+                if (this.searches.searches[query]) {
+                    return {
+                        contents: [
+                            {
+                                uri: request.params.uri,
+                                mimeType: 'application/json',
+                                text: JSON.stringify(this.searches.searches[query], null, 2),
+                            },
+                        ],
+                    };
+                }
+                // If not found in storage, perform new search
+                try {
+                    const response = await this.axiosInstance.post('/search', {
+                        api_key: API_KEY,
+                        query,
+                        search_depth: 'basic',
+                        include_answer: true,
+                        include_raw_content: false
+                    });
+                    // Save the result
+                    await this.saveSearch(query, response.data);
+                    return {
+                        contents: [
+                            {
+                                uri: request.params.uri,
+                                mimeType: 'application/json',
+                                text: JSON.stringify(response.data, null, 2),
+                            },
+                        ],
+                    };
+                }
+                catch (error) {
+                    const axiosError = error;
+                    throw new McpError(ErrorCode.InternalError, `Search failed: ${axiosError.response?.data?.message ?? axiosError.message}`);
+                }
+            }
+            throw new McpError(ErrorCode.InvalidRequest, `Invalid resource URI: ${request.params.uri}`);
         });
     }
     setupToolHandlers() {
@@ -78,6 +209,8 @@ class TavilyServer {
                     include_answer: true,
                     include_raw_content: false
                 });
+                // Save the result
+                await this.saveSearch(request.params.arguments.query, response.data);
                 console.error('Received response from Tavily API'); // Debug log
                 return {
                     content: [
@@ -110,6 +243,8 @@ class TavilyServer {
         });
     }
     async run() {
+        // Initialize storage before starting the server
+        await this.initializeStorage();
         const transport = new StdioServerTransport();
         await this.server.connect(transport);
         console.error('Tavily MCP server running on stdio');
