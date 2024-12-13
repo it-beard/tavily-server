@@ -21,7 +21,7 @@ A Model Context Protocol (MCP) server that provides AI-powered search capabiliti
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/tavily-mcp-server.git
+git clone https://github.com/it-beard/tavily-server.git
 cd tavily-mcp-server
 ```
 
