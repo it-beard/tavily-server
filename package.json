@@ -1,0 +1,14 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.3",
+    "axios": "^1.7.9"
+  }
+}
